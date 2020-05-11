@@ -1,12 +1,13 @@
 package scredis.io
 
-import akka.actor.ActorSystem
+import akka.actor.{ActorSystem, Props}
+import akka.routing.{ActorRefRoutee, Router, SmallestMailboxRoutingLogic}
 import com.typesafe.scalalogging.LazyLogging
 import scredis.exceptions._
 import scredis.protocol._
 import scredis.protocol.requests.ClusterRequests.{ClusterCountKeysInSlot, ClusterInfo, ClusterSlots}
 import scredis.util.UniqueNameGenerator
-import scredis.{ClusterSlotRange, RedisConfigDefaults, Server}
+import scredis.{ClusterSlotRange, RedisConfigDefaults, Server, Subscription}
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
@@ -35,7 +36,8 @@ abstract class ClusterConnection(
     clusterDownWait: FiniteDuration = RedisConfigDefaults.IO.Cluster.ClusterDownWait,
     systemOpt:Option[ActorSystem] = None,
     failCommandOnConnecting: Boolean = RedisConfigDefaults.Global.FailCommandOnConnecting,
-    passwordOpt: Option[String] = RedisConfigDefaults.Config.Redis.PasswordOpt
+    passwordOpt: Option[String] = RedisConfigDefaults.Config.Redis.PasswordOpt,
+    numOfDecoders: Int          = RedisConfigDefaults.IO.Akka.CountOfDecoders
   ) extends NonBlockingConnection with LazyLogging {
 
   private val maxHashMisses = 100
@@ -62,9 +64,25 @@ abstract class ClusterConnection(
   /** Miss counter for hashSlots accesses. */
   private var hashMisses = 0
 
+  private val sharedDecoders = createDecodersRouter()
+
   // bootstrapping: init with info from cluster
   // I guess is it okay to to a blocking await here? or move it to a factory method?
   Await.ready(updateCache(maxRetries), connectTimeout)
+
+
+  protected val decodingSubscription: Option[Subscription] = None
+
+  private def createDecodersRouter(): Router = {
+    val routees = Vector.fill(numOfDecoders) {
+      val ref = system.actorOf(
+        Props(classOf[DecoderActor], decodingSubscription).withDispatcher(akkaDecoderDispatcherPath),
+        UniqueNameGenerator.getNumberedName("shared-decoder-actor")
+      )
+      ActorRefRoutee(ref)
+    }
+    Router(SmallestMailboxRoutingLogic(), routees)
+  }
 
   /** Set up initial connections from configuration. */
   private def initialConnections: Map[Server, (NonBlockingConnection, Int)] =
@@ -119,11 +137,11 @@ abstract class ClusterConnection(
 
     new AkkaNonBlockingConnection(
       system = system, host = server.host, port = server.port, passwordOpt = passwordOpt,
-      database = 0, nameOpt = None, decodersCount = 2,
+      database = 0, nameOpt = None,
       receiveTimeoutOpt, connectTimeout, maxWriteBatchSize, tcpSendBufferSizeHint,
-      tcpReceiveBufferSizeHint, akkaListenerDispatcherPath, akkaIODispatcherPath,
-      akkaDecoderDispatcherPath, failCommandOnConnecting
-    ) {}
+      tcpReceiveBufferSizeHint, akkaListenerDispatcherPath, akkaIODispatcherPath, akkaDecoderDispatcherPath
+       failCommandOnConnecting
+    )
   }
 
   /** Delay a Future-returning operation. */
@@ -266,6 +284,8 @@ abstract class ClusterConnection(
         // but arbitrary choice is probably not what's intended..
         Future.failed(RedisInvalidArgumentException("This command is not supported for clusters"))
     }
+
+  // TODO:     decoders.route(Broadcast(PoisonPill), self)
 
   // TODO at init: fetch all hash slot-node associations: CLUSTER SLOTS
 }

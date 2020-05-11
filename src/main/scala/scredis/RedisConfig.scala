@@ -85,6 +85,7 @@ class RedisConfig(config: Config = ConfigFactory.load().getConfig("scredis")) {
       val IODispatcherPath = config.getString("io-dispatcher-path")
       val ListenerDispatcherPath = config.getString("listener-dispatcher-path")
       val DecoderDispatcherPath = config.getString("decoder-dispatcher-path")
+      val CountOfDecoders = config.getInt("decoder-count")
     }
 
     object Cluster {

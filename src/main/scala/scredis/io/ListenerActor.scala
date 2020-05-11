@@ -33,18 +33,19 @@ class ListenerActor(
   tcpReceiveBufferSizeHint: Int,
   akkaIODispatcherPath: String,
   akkaDecoderDispatcherPath: String,
-  failCommandOnConnecting:Boolean
+  failCommandOnConnecting:Boolean,
+  sharedDecodersOpt: Option[Router] = None
 ) extends Actor with ActorLogging {
-  
+
   import ListenerActor._
   import context.dispatcher
-  
+
   override val supervisorStrategy: SupervisorStrategy = OneForOneStrategy() {
     case e: Exception => SupervisorStrategy.Stop
   }
-  
+
   private val remote = new InetSocketAddress(host, port)
-  
+
   private var remainingByteStringOpt: Option[ByteString] = None
   private var initializationRequestsCount = 0
   private var isConnecting = false
@@ -52,7 +53,7 @@ class ListenerActor(
   private var isShuttingDownBeforeConnected = false
   private var isReceiveTimeout = false
   private var timeoutCancellableOpt: Option[Cancellable] = None
-  
+
   protected val queuedRequests = new util.LinkedList[Request[_]]()
   protected val requests = new util.LinkedList[Request[_]]()
   protected var ioActor: ActorRef = _
@@ -72,7 +73,7 @@ class ListenerActor(
     ).withDispatcher(akkaIODispatcherPath),
     UniqueNameGenerator.getUniqueName(s"${nameOpt.getOrElse(s"$host-$port")}-io-actor")
   )
-  
+
   private def createDecodersRouter(): Router = {
     val routees = Vector.fill(decodersCount) {
       val ref = context.actorOf(
@@ -84,7 +85,7 @@ class ListenerActor(
     }
     Router(SmallestMailboxRoutingLogic(), routees)
   }
-  
+
   protected def doSend(request: Request[_]): Unit = {
     receiveTimeoutOpt.foreach { receiveTimeout =>
       if (timeoutCancellableOpt.isEmpty) {
@@ -96,7 +97,7 @@ class ListenerActor(
     requests.addLast(request)
     ioActor ! request
   }
-  
+
   protected def send(requests: Request[_]*): Unit = {
     var isShuttingDown = false
     requests.foreach { request =>
@@ -132,25 +133,25 @@ class ListenerActor(
       }
     }
   }
-  
+
   protected def sendAllQueuedRequests(): Unit ={
     while (!queuedRequests.isEmpty) {
       send(queuedRequests.pop())
     }
   }
-  
+
   protected def failAllQueuedRequests(throwable: Throwable): Unit = {
     while (!queuedRequests.isEmpty) {
       queuedRequests.pop().failure(throwable)
     }
   }
-  
+
   protected def failAllSentRequests(throwable: Throwable): Unit = {
     while (!requests.isEmpty) {
       requests.pop().failure(throwable)
     }
   }
-  
+
   protected def handleData(data: ByteString, responsesCount: Int): Unit = {
     val requestsCount = this.requests.size
     val (count, skip) = if (responsesCount > requestsCount) {
@@ -164,28 +165,28 @@ class ListenerActor(
     }
     decoders.route(DecoderActor.Partition(data, requests.toList.iterator, skip), self)
   }
-  
+
   protected def receiveData(data: ByteString): Int = {
     log.debug(s"Received data: ${data.decodeString("UTF-8").replace("\r\n", "\\r\\n")}")
-    
+
     timeoutCancellableOpt.foreach(_.cancel())
     timeoutCancellableOpt = None
-    
+
     val completedData = remainingByteStringOpt match {
       case Some(remains) => remains ++ data
       case None => data
     }
-    
+
     val buffer = completedData.asByteBuffer
     val responsesCount = Protocol.count(buffer)
     val position = buffer.position()
-    
+
     if (buffer.remaining > 0) {
       remainingByteStringOpt = Some(ByteString(buffer))
     } else {
       remainingByteStringOpt = None
     }
-    
+
     if (responsesCount > 0) {
       val trimmedData = if (remainingByteStringOpt.isDefined) {
         completedData.take(position)
@@ -196,11 +197,11 @@ class ListenerActor(
     }
     responsesCount
   }
-  
+
   protected def unhandled: Receive = {
     case x => log.error(s"Received unexpected message: $x")
   }
-  
+
   protected def always: Receive = {
     case Remove(count) =>
       (1 to count).foreach(_ => requests.pop())
@@ -212,14 +213,14 @@ class ListenerActor(
       become(reconnecting)
     case _: Tcp.ConnectionClosed =>
   }
-  
+
   protected def fail: Receive = {
     case request: Request[_] => request.failure(RedisIOException("Shutting down"))
     case transaction: Transaction => transaction.execRequest.failure(
       RedisIOException("Shutting down")
     )
   }
-  
+
   protected def queue: Receive = {
     case request: Request[_] => queuedRequests.addLast(request)
     case t @ Transaction(requests) =>
@@ -229,7 +230,7 @@ class ListenerActor(
       }
       queuedRequests.addLast(t.execRequest)
   }
-  
+
   protected def sendReceive: Receive = {
     case request: Request[_] =>
       send(request)
@@ -238,9 +239,9 @@ class ListenerActor(
       send(requests: _*)
       send(t.execRequest)
   }
-  
+
   protected def become(state: Receive): Unit = context.become(state orElse always orElse unhandled)
-  
+
   protected def reconnect(): Unit = {
     ioActor = createIOActor()
     context.watch(ioActor)
@@ -248,7 +249,7 @@ class ListenerActor(
     isReceiveTimeout = false
     become(connecting)
   }
-  
+
   protected def handleReceiveTimeout(): Unit = {
     log.error("Receive timeout")
     isReceiveTimeout = true
@@ -257,18 +258,24 @@ class ListenerActor(
     ioActor ! IOActor.Shutdown
     become(reconnecting)
   }
-  
+
   protected def onConnect(): Unit = ()
   protected def onInitialized(): Unit = ()
-  
+
   protected def shutdown(): Unit = {
-    decoders.route(Broadcast(PoisonPill), self)
-    become(awaitingDecodersShutdown)
+    sharedDecodersOpt match {
+      case Some(_) =>
+        log.info("Connection has been shutdown gracefully")
+      case None    =>
+        decoders.route(Broadcast(PoisonPill), self)
+        become(awaitingDecodersShutdown)
+    }
+
   }
-  
+
   override def preStart(): Unit = {
     ioActor = createIOActor()
-    decoders = createDecodersRouter()
+    decoders = sharedDecodersOpt.getOrElse(createDecodersRouter())
     context.watch(ioActor)
     isConnecting = true
     become(connecting)
